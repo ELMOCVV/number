@@ -23,6 +23,8 @@ BTN_ADD = "➕ Добавить"
 BTN_LIST = "📋 Все номера"
 BTN_SEARCH = "🔍 Найти"
 
+PHONE_CHARS = set("0123456789+-() ")
+
 
 class AccessMiddleware(BaseMiddleware):
     def __init__(self, allowed_ids: set[int]):
@@ -53,6 +55,10 @@ class Search(StatesGroup):
 
 class EditContact(StatesGroup):
     value = State()
+
+
+class AppendNote(StatesGroup):
+    text = State()
 
 
 def dept_hash(name: str) -> str:
@@ -117,13 +123,19 @@ def contacts_kb(contacts: list, back_cb: str | None = None) -> InlineKeyboardMar
 
 
 def card_text(c) -> str:
-    return f"👤 {c['name']}\n📞 {c['phone']}\n🏭 {c['department']}"
+    text = f"👤 {c['name']}\n📞 {c['phone']}\n🏭 {c['department']}"
+    if c["note"]:
+        text += f"\n📝 {c['note']}"
+    return text
 
 
 def card_kb(c) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
+                InlineKeyboardButton(
+                    text="📝 Дополнить", callback_data=f"note:{c['id']}"
+                ),
                 InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:{c['id']}"),
                 InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{c['id']}"),
             ],
@@ -143,7 +155,10 @@ def card_kb(c) -> InlineKeyboardMarkup:
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Справочник телефонов завода.\nВыберите действие:", reply_markup=main_menu()
+        "Справочник телефонов завода.\n\n"
+        "Просто отправьте номер или имя — покажу, кто это.\n"
+        "Если номера нет — предложу добавить.",
+        reply_markup=main_menu(),
     )
 
 
@@ -182,16 +197,7 @@ async def search_start(message: Message, state: FSMContext):
 # --- Добавление контакта ---
 
 
-@router.message(AddContact.name, F.text)
-async def add_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await state.set_state(AddContact.phone)
-    await message.answer("Введите номер телефона:")
-
-
-@router.message(AddContact.phone, F.text)
-async def add_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text.strip())
+async def ask_department(message: Message, state: FSMContext):
     await state.set_state(AddContact.department)
     kb = depts_kb(prefix="pick")
     await message.answer(
@@ -200,6 +206,23 @@ async def add_phone(message: Message, state: FSMContext):
         else "Укажите цех/склад/отдел:",
         reply_markup=kb,
     )
+
+
+@router.message(AddContact.name, F.text)
+async def add_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text.strip())
+    data = await state.get_data()
+    if data.get("phone"):  # номер уже известен из быстрого поиска
+        await ask_department(message, state)
+        return
+    await state.set_state(AddContact.phone)
+    await message.answer("Введите номер телефона:")
+
+
+@router.message(AddContact.phone, F.text)
+async def add_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text.strip())
+    await ask_department(message, state)
 
 
 async def show_preview(message: Message, state: FSMContext):
@@ -304,6 +327,7 @@ async def cb_edit(callback: CallbackQuery):
                 InlineKeyboardButton(text="Имя", callback_data=f"editf:{cid}:name"),
                 InlineKeyboardButton(text="Номер", callback_data=f"editf:{cid}:phone"),
                 InlineKeyboardButton(text="Цех", callback_data=f"editf:{cid}:department"),
+                InlineKeyboardButton(text="Заметка", callback_data=f"editf:{cid}:note"),
             ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"card:{cid}")],
         ]
@@ -321,6 +345,7 @@ async def cb_edit_field(callback: CallbackQuery, state: FSMContext):
         "name": "Введите новое имя:",
         "phone": "Введите новый номер:",
         "department": "Укажите новый цех/склад/отдел:",
+        "note": "Введите заметку (заменит текущую):",
     }
     kb = depts_kb(prefix="pick") if field == "department" else None
     await callback.message.answer(prompts[field], reply_markup=kb)
@@ -401,18 +426,80 @@ async def cb_delete(callback: CallbackQuery):
 @router.message(Search.query, F.text)
 async def search_query(message: Message, state: FSMContext):
     await state.clear()
-    results = db.search_contacts(message.text.strip())
-    if not results:
-        await message.answer("Ничего не найдено.", reply_markup=main_menu())
+    await quick_lookup(message, state)
+
+
+# --- Дополнение информации ---
+
+
+@router.callback_query(F.data.startswith("note:"))
+async def cb_note(callback: CallbackQuery, state: FSMContext):
+    cid = int(callback.data.split(":", 1)[1])
+    c = db.get_contact(cid)
+    if c is None:
+        await callback.answer("Контакт не найден", show_alert=True)
         return
-    await message.answer(
-        f"Найдено: {len(results)}", reply_markup=contacts_kb(results)
-    )
+    await state.set_state(AppendNote.text)
+    await state.update_data(contact_id=cid)
+    await callback.message.answer(f"Что добавить к «{c['name']}»?")
+    await callback.answer()
 
 
-# --- Фолбэк ---
+@router.message(AppendNote.text, F.text)
+async def note_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    db.append_note(data["contact_id"], message.text.strip())
+    c = db.get_contact(data["contact_id"])
+    await message.answer(f"✅ Дополнено.\n\n{card_text(c)}", reply_markup=card_kb(c))
+
+
+# --- Быстрый поиск: любой текст вне сценария ---
+
+
+@router.callback_query(F.data == "addnew")
+async def cb_add_number(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    phone = data.get("pending_phone")
+    await state.clear()
+    await state.set_state(AddContact.name)
+    if phone:
+        await state.update_data(phone=phone)
+        await callback.message.edit_text(f"➕ Новый контакт\n📞 {phone}")
+    await callback.message.answer("Введите имя:")
+    await callback.answer()
+
+
+def looks_like_phone(text: str) -> bool:
+    return any(ch.isdigit() for ch in text) and all(ch in PHONE_CHARS for ch in text)
 
 
 @router.message(StateFilter(None), F.text)
-async def fallback(message: Message):
-    await message.answer("Используйте кнопки меню ниже 👇", reply_markup=main_menu())
+async def quick_lookup(message: Message, state: FSMContext):
+    query = message.text.strip()
+    is_phone = looks_like_phone(query)
+    results = db.find_by_phone(query) if is_phone else db.search_contacts(query)
+
+    if len(results) == 1:
+        c = results[0]
+        await message.answer(card_text(c), reply_markup=card_kb(c))
+        return
+    if results:
+        await message.answer(
+            f"Найдено: {len(results)}", reply_markup=contacts_kb(results)
+        )
+        return
+    if is_phone:
+        await state.update_data(pending_phone=query)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="➕ Добавить этот номер", callback_data="addnew"
+                    )
+                ]
+            ]
+        )
+        await message.answer(f"❌ Номер {query} не найден.", reply_markup=kb)
+        return
+    await message.answer("Ничего не найдено.", reply_markup=main_menu())
